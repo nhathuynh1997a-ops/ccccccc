@@ -74,6 +74,8 @@ class BotState:
         self._PENDING_IMAGE_TTL: float = getattr(Config, 'PENDING_IMAGE_TTL', 180.0)
         self._tab_fail_count: dict = {}
         self._TAB_FAIL_THRESHOLD: int = getattr(Config, "TAB_FAIL_THRESHOLD", 5)
+        # NEW: manual CF verification events (key -> asyncio.Event)
+        self._manual_cf_events: dict = {}
 
 
 bot_state = BotState()
@@ -813,8 +815,15 @@ async def wait_for_manual_cf_verification(page, max_wait: float = None) -> bool:
     except Exception:
         pass
 
+    # Determine a domain key for this page
+    try:
+        page_url = page.url
+    except Exception:
+        page_url = ""
+    domain_key = normalize_domain(page_url) or "manual_cf"
+
     logger.warning("⚠️ SKIP_AUTO_VERIFY=TRUE — please manually complete Cloudflare on Edge.")
-    logger.warning(f"⏳ Waiting up to {int(max_wait)}s for manual verification...")
+    logger.warning(f"⏳ Waiting up to {int(max_wait)}s for manual verification (domain: {domain_key})...")
 
     BTN_SELECTORS = [
         "button:has-text('Xác thực')",
@@ -829,44 +838,65 @@ async def wait_for_manual_cf_verification(page, max_wait: float = None) -> bool:
 
     deadline = time.time() + max_wait
 
+    # create an asyncio.Event to allow Telegram /verify signal to wake this wait
+    ev = asyncio.Event()
+    bot_state._manual_cf_events[domain_key] = ev
+
     # send Telegram alert if admin configured
     try:
         admin_id = getattr(Config, "TELEGRAM_ADMIN_ID", 0)
         if admin_id and client:
-            msg = "🚨 BOT: Cloudflare/Turnstile detected — please verify manually on Edge."
+            msg = (
+                f"🚨 BOT: Cloudflare/Turnstile detected on {domain_key or page_url} — please verify manually on Edge.\n\n"
+                "Sau khi verify, reply here with `/cf_verified {domain}` hoặc `/cf_verified` để tiếp tục."
+            )
             asyncio.create_task(send_alert_to_user(client, msg, admin_id))
     except Exception:
         pass
 
-    while time.time() < deadline:
-        modal_present = False
-        for sel in modal_selectors:
-            try:
-                el = await page.query_selector(sel)
-                if el and await safe_is_visible(el):
-                    modal_present = True
-                    break
-            except Exception:
-                continue
-        if not modal_present:
-            logger.info("✅ Modal Turnstile không còn hiển thị → coi như verified")
-            return True
+    try:
+        while time.time() < deadline:
+            # Check if Telegram admin signaled verification
+            if ev.is_set():
+                logger.info("✅ Manual verification signaled via Telegram")
+                return True
 
-        for sel in BTN_SELECTORS:
-            try:
-                btn = await page.query_selector(sel)
-                if btn and await safe_is_visible(btn):
-                    disabled = await btn.get_attribute("disabled")
-                    if disabled is None:
-                        logger.info("✅ Nút 'Xác thực' đã enable — người dùng đã verify")
-                        return True
-            except Exception:
-                continue
+            # Check modal presence
+            modal_present = False
+            for sel in modal_selectors:
+                try:
+                    el = await page.query_selector(sel)
+                    if el and await safe_is_visible(el):
+                        modal_present = True
+                        break
+                except Exception:
+                    continue
+            if not modal_present:
+                logger.info("✅ Modal Turnstile không còn hiển thị → coi như verified")
+                return True
 
-        await asyncio.sleep(0.5)
+            # Check if verify button enabled
+            for sel in BTN_SELECTORS:
+                try:
+                    btn = await page.query_selector(sel)
+                    if btn and await safe_is_visible(btn):
+                        disabled = await btn.get_attribute("disabled")
+                        if disabled is None:
+                            logger.info("✅ Nút 'Xác thực' đã enable — người dùng đã verify")
+                            return True
+                except Exception:
+                    continue
 
-    logger.warning("⏰ Timeout chờ manual verification")
-    return False
+            await asyncio.sleep(0.5)
+
+        logger.warning("⏰ Timeout chờ manual verification")
+        return False
+    finally:
+        # cleanup event
+        try:
+            bot_state._manual_cf_events.pop(domain_key, None)
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -888,494 +918,51 @@ async def _fetch_element_text(page, selector: str) -> str:
     except Exception:
         return ""
 
+# ... rest of file unchanged ...
 
-def _filter_nextjs_noise(text: str) -> str:
-    if not text:
-        return ""
-    noise_markers = [
-        "__next_f", "__NEXT", "self.__next",
-        'push([1,"', '"stylesheet"', '"link"',
-        "webpack", "hydrat", '"rel":', '"href":',
-        ":[[[\"$\"',
-    ]
-    t = text.strip()
-    for marker in noise_markers:
-        if marker in t:
-            return ""
-    if t.startswith(('{"', '[[', '[[["', 'self.')):
-        return ""
-    return t
+# ============================================================
+# TELEGRAM ADMIN COMMANDS (Manual CF verification)
+# ============================================================
 
+@client.on(events.NewMessage(pattern=r'^/cf_verified(?:\s+(.+))?$', incoming=True))
+async def handle_cf_verified(event):
+    try:
+        sender = await event.get_sender()
+        admin_id = getattr(Config, "TELEGRAM_ADMIN_ID", 0)
+        if admin_id and sender and sender.id != admin_id:
+            await event.respond("⚠️ Bạn không được phép thực hiện lệnh này.")
+            return
 
-async def detect_result_text(page) -> str:
-    PRIORITY_SELECTORS = [
-        ".swal2-html-container", ".swal2-title", ".swal2-popup",
-        "div[class*='popup'] p",
-        "div[class*='modal'] p",
-        "div[class*='dialog'] p",
-        "div[class*='alert'] p",
-        "div[class*='notice'] p",
-        ".text-red-600", ".text-green-600", ".text-yellow-600",
-        ".text-red-500", ".text-green-500",
-        "p.mt-1.text-sm",
-        "div[class*='rounded-2xl'] p",
-        "div[class*='rounded-xl'] p",
-        "div[class*='rounded-lg'] p",
-        "[role='alert']", "[role='status']", "[role='dialog']",
-        "div[style*='position: fixed'] p",
-        "div[style*='position:fixed'] p",
-    ]
-    
-    for sel in PRIORITY_SELECTORS:
+        # Extract optional domain
+        domain_arg = None
         try:
-            txt = await _fetch_element_text(page, sel)
-            if txt and len(txt.strip()) >= 3:
-                clean = _filter_nextjs_noise(txt.strip())
-                if clean:
-                    return clean
+            domain_arg = event.pattern_match.group(1)
+            if domain_arg:
+                domain_arg = domain_arg.strip()
         except Exception:
-            pass
-    
-    result_selectors = [
-        ".text-red-600", ".text-green-600", "p.mt-1.text-sm",
-        "div[class*='rounded-2xl'] p",
-        "div[class*='rounded-xl'] p",
-        "div[class*='rounded-lg'] p",
-        "[role='dialog']", "[role='alert']", "[role='status']",
-        ".modal-body", ".modal-content", ".popup-content",
-        ".alert", "[class*='success']", "[class*='error']",
-        "[class*='toast']", "[class*='result']",
-        "[class*='notify']", "[class*='modal']", "[class*='popup']",
-        "[class*='notification']", "div[style*='position: fixed']",
-    ]
-    
-    tasks = [_fetch_element_text(page, sel) for sel in result_selectors]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    combined = ""
-    
-    for r in results:
-        if isinstance(r, str) and r.strip():
-            filtered = _filter_nextjs_noise(r.strip())
-            if filtered:
-                combined += filtered + " "
-    
-    if len(combined.strip()) >= 3:
-        return combined.strip()
-    
-    try:
-        page_text = await page.evaluate("""
-            () => {
-                const keywords = [
-                    'thành công', 'thanh cong', 'thất bại', 'that bai',
-                    'sai', 'lỗi', 'loi', 'đã sử dụng', 'da su dung',
-                    'success', 'failed', 'error', 'invalid', 'used',
-                    'không hợp lệ', 'khong hop le', 'hết hạn', 'het han',
-                    'không đúng', 'không tồn tại',
-                ];
-                const noisePatterns = ['__next_f', '__NEXT', 'self.__next', 'push([', 'webpack'];
-                const walker = document.createTreeWalker(
-                    document.body, NodeFilter.SHOW_TEXT, null, false
-                );
-                let node;
-                while (node = walker.nextNode()) {
-                    const parent = node.parentElement;
-                    if (!parent) continue;
-                    const tag = parent.tagName || '';
-                    if (['SCRIPT','STYLE','NOSCRIPT'].includes(tag)) continue;
-                    const txt = (node.textContent || '').trim();
-                    if (txt.length < 3) continue;
-                    if (noisePatterns.some(p => txt.includes(p))) continue;
-                    const lower = txt.toLowerCase();
-                    if (keywords.some(k => lower.includes(k))) return txt;
-                }
-                return '';
-            }
-        """)
-        if page_text:
-            clean = _filter_nextjs_noise(page_text)
-            if clean:
-                return clean
-    except Exception:
-        pass
-    
-    return ""
+            domain_arg = None
 
-
-async def take_result_screenshot(page, user: str, code: str, target_url: str, status: str) -> str:
-    if not bool(getattr(Config, "SCREENSHOT_ON_UNKNOWN", False)):
-        return ""
-    try:
-        shot_dir = Path("logs/screenshots")
-        shot_dir.mkdir(parents=True, exist_ok=True)
-        safe_domain = normalize_domain(target_url).replace(".", "_").replace("/", "_")
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = shot_dir / f"{safe_domain}_{user}_{code}_{status}_{ts}.png"
-        await page.screenshot(path=str(path), full_page=False)
-        return str(path)
-    except Exception as e:
-        logger.debug(f"⚠️ Cannot take screenshot: {e}")
-        return ""
-
-
-async def connect_to_cdp_port(port: int):
-    if port in bot_state.connected_browsers:
-        return bot_state.connected_browsers[port]
-
-    logger.info(f"🖥️ Connecting to CDP port {port}...")
-    browser = await bot_state.playwright_instance.chromium.connect_over_cdp(
-        f"http://127.0.0.1:{port}"
-    )
-    bot_state.connected_browsers[port] = browser
-
-    logger.info(f"✅ Connected to CDP port {port}")
-    return browser
-
-
-async def _setup_page_performance(page, label: str = ""):
-    _BLOCK_DOMAINS = (
-        "google-analytics", "googletagmanager", "doubleclick",
-        "facebook.net", "fbcdn.net", "hotjar",
-    )
-    _BLOCK_TYPES = ("media", "ping")
-
-    async def _handle_route(route):
-        req = route.request
-        url = req.url.lower()
-        rtype = req.resource_type
-
-        if "cloudflare" in url:
-            await route.continue_()
-            return
-
-        if any(d in url for d in _BLOCK_DOMAINS):
-            await route.abort()
-            return
-
-        if rtype in _BLOCK_TYPES:
-            await route.abort()
-            return
-
-        await route.continue_()
-
-    try:
-        await page.route("**/*", _handle_route)
-    except Exception as e:
-        logger.debug(f"⚠️ [{label}] Cannot setup route: {e}")
-
-
-
-async def _close_unwanted_popups(page):
-    try:
-        closed = await page.evaluate("""
-            () => {
-                const CLOSE_KEYWORDS = ['đóng', 'close', 'x', 'cancel', 'hủy', 'dismiss', 'got it', 'ok', 'thoát'];
-                const SKIP_TEXT = ['xác thực', 'xac thuc', 'submit', 'kiểm tra', 'áp dụng', 'nhận'];
-                const OVERLAY_SEL = [
-                    '.modal', '[class*="modal" i]', '[class*="popup" i]',
-                    '[class*="overlay" i]', '[class*="dialog" i]',
-                    '[class*="notification" i]', '[class*="toast" i]',
-                    '[class*="alert" i]:not(.alert-success):not(.alert-info)',
-                    '[class*="banner" i]', '[class*="announcement" i]',
-                ];
-                let count = 0;
-                for (const sel of OVERLAY_SEL) {
-                    const els = [...document.querySelectorAll(sel)];
-                    for (const el of els) {
-                        const style = window.getComputedStyle(el);
-                        if (style.display === 'none' || style.visibility === 'hidden') continue;
-                        const rect = el.getBoundingClientRect();
-                        if (rect.width === 0 || rect.height === 0) continue;
-                        const btns = [...el.querySelectorAll('button, [role="button"], a, span')];
-                        for (const btn of btns) {
-                            const txt = (btn.innerText || btn.textContent || btn.getAttribute('aria-label') || '').trim().toLowerCase();
-                            if (SKIP_TEXT.some(s => txt.includes(s))) continue;
-                            if (CLOSE_KEYWORDS.some(k => txt === k || txt.startsWith(k))) {
-                                btn.click();
-                                count++;
-                                break;
-                            }
-                        }
-                    }
-                }
-                return count;
-            }
-        """)
-        if closed and closed > 0:
-            logger.debug(f"🧹 Đóng {closed} popup không mong muốn")
-            await asyncio.sleep(0.3)
-    except Exception:
-        pass
-
-
-async def _wake_tab_for_submit(page):
-    try:
-        await maybe_bring_to_front(page)
-        await page.evaluate("""
-            Object.defineProperty(document, 'visibilityState', {
-                get: () => 'visible', configurable: true
-            });
-        """)
-        await _close_unwanted_popups(page)
-    except Exception:
-        pass
-
-
-async def auto_fill_username_on_startup(page, domain: str, username: str):
-    try:
-        await scroll_to_input_fields(page)
-        await asyncio.sleep(0.3)
-        
-        username_input, _ = await find_input_fields(page, cache_key=None)
-        if not username_input:
-            return False
-        
-        current_value = await get_input_value(username_input)
-        
-        if current_value.lower() == username.lower():
-            return True
-        
-        if current_value == "":
-            await username_input.fill(username)
-            logger.info(f"✅ [{domain}] Filled username: {username}")
-            return True
-        
-        return False
-    
-    except Exception as e:
-        logger.warning(f"⚠️ [{domain}] Cannot fill username: {e}")
-        return False
-
-
-async def _setup_one_domain_tab(item: dict, assigned_pages: set, assign_lock: asyncio.Lock):
-    label = item.get("key", item["domain"])
-    try:
-        return await asyncio.wait_for(
-            _setup_one_domain_tab_inner(item, assigned_pages, assign_lock),
-            timeout=20.0,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(f"⏰ [{label}] Setup timeout 20s")
-        return False
-    except Exception as e:
-        logger.error(f"❌ [{label}] Setup error: {e}")
-        return False
-
-
-async def _setup_one_domain_tab_inner(item: dict, assigned_pages: set, assign_lock: asyncio.Lock):
-    target_url = item["target_url"]
-    domain = item["domain"]
-    port = item["port"]
-    accounts = item["accounts"]
-    key = item.get("key", domain)
-    
-    browser = await connect_to_cdp_port(port)
-    if not browser.contexts:
-        logger.error(f"❌ [{domain}] Port {port} has no context")
-        return False
-    
-    context = browser.contexts[0]
-    page = None
-    reason = ""
-    
-    async with assign_lock:
-        for p in context.pages:
-            try:
-                if domain in p.url.lower() and p not in assigned_pages:
-                    page = p
-                    reason = "tab_existing"
-                    assigned_pages.add(page)
-                    break
-            except Exception:
-                pass
-        
-        if not page:
-            if bool(getattr(Config, "AUTO_OPEN_MISSING_TABS", True)):
-                page = await context.new_page()
-                assigned_pages.add(page)
-                reason = "tab_new"
+        if domain_arg:
+            key = domain_arg.lower()
+            ev = bot_state._manual_cf_events.get(key)
+            if not ev:
+                # try normalized URL
+                norm = normalize_domain(domain_arg)
+                ev = bot_state._manual_cf_events.get(norm)
+                key = norm
+            if ev:
+                ev.set()
+                await event.respond(f"✅ Đã đánh dấu verified cho {key}")
             else:
-                logger.error(f"❌ [{domain}] No tab available")
-                return False
-    
-    if reason == "tab_new":
-        await _setup_page_performance(page, label=domain)
-        try:
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=10000)
-            await scroll_to_input_fields(page)
-            await asyncio.sleep(0.5)
-        except Exception as e:
-            logger.warning(f"⚠️ [{domain}] Page load error (continuing): {e}")
-    else:
-        await _setup_page_performance(page, label=domain)
-        await scroll_to_input_fields(page)
-        await asyncio.sleep(0.5)
-    
-    bot_state.account_pages[key] = page
-    bot_state.context_locks[key] = asyncio.Lock()
-    bot_state.cf_verified[key] = True
-    bot_state.submission_count[key] = 0
-    
-    try:
-        await maybe_bring_to_front(page)
-    except Exception:
-        pass
-    
-    first_account = accounts[0]["username"] if accounts else ""
-    if first_account:
-        await auto_fill_username_on_startup(page, key, first_account)
-    
-    _, code_input = await find_input_fields(page)
-    
-    if code_input:
-        logger.info(f"✅ [{key}] Ready | acc: {[a['username'] for a in accounts]}")
-    else:
-        logger.warning(f"⚠️ [{key}] Code input not found (Cloudflare?)")
-    
-    return True
-
-
-async def preload_browsers_and_accounts():
-    bot_state._site_code_seen.clear()
-    logger.info("🧹 Cleared runtime code cache (_site_code_seen)")
-    
-    account_targets = build_unique_account_targets()
-    if not account_targets:
-        logger.error("❌ No channels configured")
-        return
-    
-    total_tabs = len(account_targets)
-    logger.info(f"🔄 Opening {total_tabs} tabs...")
-    
-    assigned_pages = set()
-    assign_lock = asyncio.Lock()
-    done_count = 0
-    done_lock = asyncio.Lock()
-    
-    async def _setup_with_progress(item):
-        nonlocal done_count
-        result = await _setup_one_domain_tab(item, assigned_pages, assign_lock)
-        async with done_lock:
-            done_count += 1
-            status = "✅" if result else "❌"
-            logger.info(f"  {status} [{done_count}/{total_tabs}] {item.get('key', item['domain'])}")
-        return result
-    
-    results = await asyncio.gather(
-        *[_setup_with_progress(item) for item in account_targets],
-        return_exceptions=True,
-    )
-    
-    ok = sum(1 for r in results if r is True)
-    logger.info(f"✅ Complete: {ok}/{total_tabs} tabs ready")
-    if ok < total_tabs:
-        logger.warning(f"⚠️ {total_tabs - ok} tabs failed")
-    logger.info("🤖 BOT RUNNING — listening to Telegram...")
-
-
-# ============================================================
-# CODE EXTRACTION & VALIDATION
-# ============================================================
-
-def validate_candidate(code: str, target_url: str, source: str = "normal"):
-    try:
-        return CodeValidator.validate_code(code, target_url, source=source)
-    except TypeError:
-        return CodeValidator.validate_code(code, target_url)
-
-
-def get_filter_group_name(target_url: str) -> str:
-    group_name, _ = CodeValidator.get_filter_group(target_url)
-    return group_name
-
-
-def unique_keep_order(items):
-    seen = set()
-    result = []
-    for item in items:
-        clean = CodeValidator.clean_code(item)
-        if not clean:
-            continue
-        upper = clean.upper()
-        if upper not in seen:
-            seen.add(upper)
-            result.append(clean)
-    return result
-
-
-def remove_noise_from_text(text: str) -> str:
-    cleaned = text or ""
-    cleaned = re.sub(r"https?://\S+", " ", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"www\.\S+", " ", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(
-        r"\b[a-zA-Z0-9.-]+\.(com|net|org|vn|app|info)\b", " ", cleaned, flags=re.IGNORECASE
-    )
-    cleaned = cleaned.replace("：", ":").replace("|", " ").replace("•", " ")
-    return cleaned
-
-
-def line_has_code_marker(line: str) -> bool:
-    upper = line.upper()
-    markers = [
-        "NHẬN CODE NGAY", "NHAN CODE NGAY",
-        "NHẬN CODE", "NHAN CODE",
-        "NHẬP CODE", "NHAP CODE",
-        "PHÁT CODE", "PHAT CODE",
-        "CODE FREE", "FREE CODE",
-        "GIFT CODE", "GIFTCODE",
-        "TẶNG CODE", "TANG CODE",
-    ]
-    return any(m in upper for m in markers)
-
-
-def line_is_noise(line: str) -> bool:
-    upper = line.upper().strip()
-    if not upper:
-        return True
-    noise_keywords = [
-        "HTTP", "WWW", ".COM", "FACEBOOK", "TELEGRAM", "TIKTOK", "ZALO",
-        "CSKH", "BOT", "CHECK LINK", "LINK",
-    ]
-    return any(kw in upper for kw in noise_keywords)
-
-
-def extract_tokens_from_line(line: str):
-    special_chars = re.escape(getattr(Config, "SPECIAL_CODE_CHARS_30", ""))
-    min_len = getattr(Config, "CODE_MIN_LENGTH", 6)
-    max_len = getattr(Config, "CODE_MAX_LENGTH", 15)
-    max_raw_len = max_len + 30
-    pattern = rf"[A-Za-z0-9{special_chars}]{{{min_len},{max_raw_len}}}"
-    tokens = []
-    for candidate in re.findall(pattern, line or ""):
-        clean = CodeValidator.clean_code(candidate)
-        if min_len <= len(clean) <= max_len:
-            tokens.append(candidate)
-    return tokens
-
-
-def extract_spoiler_codes(event, target_url: str):
-    codes = []
-    if not event.message.entities:
-        return codes
-    try:
-        for entity, entity_text in event.message.get_entities_text():
-            if not isinstance(entity, MessageEntitySpoiler):
-                continue
-            spoiler_text = (entity_text or "").strip()
-            if not spoiler_text:
-                continue
-            spoiler_lines = spoiler_text.splitlines() if "\n" in spoiler_text else [spoiler_text]
-            for spoiler_line in spoiler_lines:
-                spoiler_line = spoiler_line.strip()
-                if not spoiler_line:
-                    continue
-                tokens = extract_tokens_from_line(spoiler_line) or [spoiler_line]
-                for token in tokens:
-                    validation = validate_candidate(token, target_url, source="spoiler")
-                    if validation["valid"]:
-                        codes.append(validation["clean_code"])
-                        logger.info(f"🔒 Spoiler code: {validation['clean_code']}")
+                await event.respond("⚠️ Không thấy pending CF cho domain đó.")
+        else:
+            # mark all pending as verified
+            for k, ev in list(bot_state._manual_cf_events.items()):
+                try:
+                    ev.set()
+                except Exception:
+                    pass
+            await event.respond("✅ Đã đánh dấu verified cho tất cả pending CF")
     except Exception as e:
-        logger.warning(f"⚠️ Error reading spoiler: {e}")
-    return unique_keep_order(codes)
+        logger.debug(f"⚠️ handle_cf_verified error: {e}")
 
-# (file continues unchanged for brevity...)
