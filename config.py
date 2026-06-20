@@ -48,14 +48,11 @@ class Config:
     TESSERACT_PATH = os.getenv("TESSERACT_PATH", "")   # Windows: C:\Program Files\Tesseract-OCR\tesseract.exe
 
     # ── Danh sách site CÓ captcha hình ảnh ──────────────────────────────────
-    # Chỉ những site này mới gọi handle_image_captcha() sau khi submit.
-    # Thêm domain vào đây nếu phát hiện site mới xuất hiện captcha.
-    # Ví dụ: "tangquaqq88.com", "o8code.com"
     CAPTCHA_SITES: list = [s.strip() for s in os.getenv(
         "CAPTCHA_SITES",
         "uy88code.org,mmoocode.shop,llwincode.com"
     ).split(",") if s.strip()]
-    TESSERACT_PATH = os.getenv("TESSERACT_PATH", "")   # Windows: C:\Program Files\Tesseract-OCR\tesseract.exe
+    TESSERACT_PATH = os.getenv("TESSERACT_PATH", "")
     API_ID = get_int_env("API_ID", 0)
     API_HASH = os.getenv("API_HASH", "")
     SESSION_NAME = os.getenv("SESSION_NAME", "session_bot_full")
@@ -80,7 +77,7 @@ class Config:
     CODE_MIN_LENGTH = 6
     CODE_MAX_LENGTH = 15
 
-    SPECIAL_CODE_CHARS_30 = r"""~!@#$%^&*()_+{}|:\"<>?`=[]\;',./"""
+    SPECIAL_CODE_CHARS_30 = r"""~!@#$%^&*()_+{}|:\"<>?`=[]\\;',./"""
 
     CODE_FILTER_GROUPS = {
         "multi_site_strict": {
@@ -235,7 +232,7 @@ class Config:
 
     BROWSER_EXE_PATH = os.getenv(
         "BROWSER_EXE_PATH",
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+        r"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
     )
     BROWSER_PROFILE = os.getenv("BROWSER_PROFILE", "Default")
 
@@ -509,3 +506,14 @@ class Config:
     # NEW FLAG: nếu True thì bỏ qua auto verify Cloudflare/Turnstile
     SKIP_AUTO_VERIFY = get_bool_env("SKIP_AUTO_VERIFY", False)
 
+    # NEW FLAG: nếu True thì KHÔNG đưa cửa sổ lên foreground
+    SKIP_BRING_TO_FRONT = get_bool_env("SKIP_BRING_TO_FRONT", False)
+
+    # Manual CF timeout (giây)
+    MANUAL_CF_TIMEOUT = get_int_env("MANUAL_CF_TIMEOUT", 300)
+
+    # Telegram admin to receive CF alerts (0 = disabled)
+    TELEGRAM_ADMIN_ID = get_int_env("TELEGRAM_ADMIN_ID", 0)
+
+    # ==========================================
+    # (rest of file unchanged)
