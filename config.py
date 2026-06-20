@@ -17,14 +17,20 @@ def get_int_env(key: str, default: int) -> int:
     value = os.getenv(key)
     if value is None or str(value).strip() == "":
         return default
-    return int(value)
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 
 def get_float_env(key: str, default: float) -> float:
     value = os.getenv(key)
     if value is None or str(value).strip() == "":
         return default
-    return float(value)
+    try:
+        return float(value)
+    except Exception:
+        return default
 
 
 def get_bool_env(key: str, default: bool) -> bool:
@@ -74,7 +80,7 @@ class Config:
     CODE_MIN_LENGTH = 6
     CODE_MAX_LENGTH = 15
 
-    SPECIAL_CODE_CHARS_30 = r"""~!@#$%^&*()_+{}|:"<>?`=[]\;',./"""
+    SPECIAL_CODE_CHARS_30 = r"""~!@#$%^&*()_+{}|:\"<>?`=[]\;',./"""
 
     CODE_FILTER_GROUPS = {
         "multi_site_strict": {
@@ -499,3 +505,7 @@ class Config:
     ENABLE_MONITORING = True
     ENABLE_AUTO_SESSION_ROTATION = False
     ENABLE_ADVANCED_ANTI_DETECTION = True
+
+    # NEW FLAG: nếu True thì bỏ qua auto verify Cloudflare/Turnstile
+    SKIP_AUTO_VERIFY = get_bool_env("SKIP_AUTO_VERIFY", False)
+
